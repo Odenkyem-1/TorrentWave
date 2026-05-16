@@ -17,6 +17,20 @@ class TorrentManager:
 
         self.handles = {}          # torrent_handle -> info dict
         self.default_save_path = str(Path.home() / "Downloads")
+        self.app_data_dir = Path.home() / ".torrentwave"
+        self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        self.load_resume_data()
+
+    def load_resume_data(self):
+        for resume_file in self.app_data_dir.glob("*.resume"):
+            try:
+                with open(resume_file, "rb") as f:
+                    data = f.read()
+                params = lt.read_resume_data(data)
+                handle = self.session.add_torrent(params)
+                self.handles[handle] = {'handle': handle, 'save_path': params.save_path, 'name': ''}
+            except Exception as e:
+                print(f"Failed to load resume data {resume_file}: {e}")
 
     def add_torrent(self, uri_or_path, save_path=None):
         """Add from .torrent file or magnet URI."""
@@ -34,6 +48,14 @@ class TorrentManager:
         if handle in self.handles:
             self.session.remove_torrent(handle, 1 if delete_files else 0)
             del self.handles[handle]
+
+    def pause_torrent(self, handle):
+        if handle.is_valid():
+            handle.pause()
+
+    def resume_torrent(self, handle):
+        if handle.is_valid():
+            handle.resume()
 
     def get_status(self, handle):
         s = handle.status()
@@ -60,9 +82,16 @@ class TorrentManager:
         self.session.apply_settings(settings)
 
     def save_resume_data(self):
+        self.session.pause()
         for h in self.handles:
-            h.save_resume_data()
-        # later you can load resume files via session.add_torrent() with resume_data
+            if h.is_valid() and h.status().has_metadata:
+                h.save_resume_data(lt.resume_data_flags_t.save_info_dict)
+        
+        # Process alerts to actually save the files before exiting
+        end_time = time.time() + 2.0
+        while time.time() < end_time:
+            self.tick()
+            time.sleep(0.1)
 
     def tick(self):
         """Call this periodically (e.g., via QTimer) to process alerts."""
@@ -70,3 +99,12 @@ class TorrentManager:
         for a in alerts:
             if a.category() & lt.alert.category_t.error_notification:
                 print(f"[Libtorrent Error] {a.message()}")
+            elif isinstance(a, lt.save_resume_data_alert):
+                try:
+                    data = lt.bencode(lt.write_resume_data(a.params))
+                    info_hash = str(a.handle.info_hash())
+                    filepath = self.app_data_dir / f"{info_hash}.resume"
+                    with open(filepath, "wb") as f:
+                        f.write(data)
+                except Exception as e:
+                    print(f"Failed to save resume data: {e}")
